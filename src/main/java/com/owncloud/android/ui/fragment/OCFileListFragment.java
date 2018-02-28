@@ -173,6 +173,10 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     private boolean searchFragment = false;
     private SearchEvent searchEvent;
     private AsyncTask remoteOperationAsyncTask;
+    private RecyclerView.OnScrollListener onScrollChangeListener;
+    private boolean photoSearchQueryRunning;
+    private boolean photoSearchNoNew = false;
+    private RemoteOperation remoteOperation;
 
     private enum MenuItemAddRemove {
         DO_NOTHING, REMOVE_SORT, REMOVE_GRID_AND_SORT, ADD_SORT, ADD_GRID_AND_SORT, ADD_GRID_AND_SORT_WITH_SEARCH,
@@ -204,6 +208,25 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         if (isGridViewPreferred(getCurrentFile())) {
             switchToGridView();
         }
+
+        onScrollChangeListener = new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(RecyclerView recyclerView, int dx, int dy) {
+                super.onScrolled(recyclerView, dx, dy);
+
+                LinearLayoutManager linearLayoutManager = (LinearLayoutManager) getRecyclerView().getLayoutManager();
+
+                int totalItemCount = linearLayoutManager.getItemCount();
+                int lastVisibleItem = linearLayoutManager.findLastVisibleItemPosition();
+                if (!photoSearchQueryRunning && totalItemCount <= (lastVisibleItem + 5)) {
+                    Log_OC.d("SCROLL", "load next");
+
+                    search();
+
+                    photoSearchQueryRunning = true;
+                }
+            }
+        };
     }
 
     /**
@@ -349,7 +372,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         searchEvent = Parcels.unwrap(getArguments().getParcelable(OCFileListFragment.SEARCH_EVENT));
         prepareCurrentSearch(searchEvent);
         if (searchEvent != null && savedInstanceState == null) {
-            onMessageEvent(searchEvent);
+            onMessageEvent(searchEvent, true);
         }
 
         setTitle();
@@ -375,6 +398,8 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
                 currentSearchType = SearchType.RECENTLY_MODIFIED_SEARCH;
             } else if (event.getSearchType().equals(SearchOperation.SearchType.SHARED_SEARCH)) {
                 currentSearchType = SearchType.SHARED_FILTER;
+            } else if (event.getSearchType().equals(SearchOperation.SearchType.PHOTO_SEARCH)) {
+                currentSearchType = SearchType.PHOTO_SEARCH;
             }
 
             prepareActionBarItems(event);
@@ -715,7 +740,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         }
 
         if (searchEvent != null) {
-            onMessageEvent(searchEvent);
+            onMessageEvent(searchEvent, true);
         }
     }
 
@@ -1452,10 +1477,10 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     }
 
     @Subscribe(threadMode = ThreadMode.BACKGROUND)
-    public void onMessageEvent(final SearchEvent event) {
+    public void onMessageEvent(final SearchEvent event, boolean clear) {
         searchFragment = true;
         setEmptyListLoadingMessage();
-        mAdapter.setData(new ArrayList<>(), SearchType.NO_SEARCH, mContainerActivity.getStorageManager(), mFile);
+        mAdapter.setData(new ArrayList<>(), SearchType.NO_SEARCH, mContainerActivity.getStorageManager(), mFile, true);
 
         setFabEnabled(false);
 
@@ -1506,7 +1531,6 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             new Handler(Looper.getMainLooper()).post(switchViewsRunnable);
         }
 
-        final RemoteOperation remoteOperation;
         if (!currentSearchType.equals(SearchType.SHARED_FILTER)) {
             boolean searchOnlyFolders = false;
             if (getArguments() != null && getArguments().getBoolean(ARG_SEARCH_ONLY_FOLDER, false)) {
@@ -1518,55 +1542,83 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             remoteOperation = new GetRemoteSharesOperation();
         }
 
-        final Account currentAccount = AccountUtils.getCurrentOwnCloudAccount(MainApp.getAppContext());
+        search();
 
-        remoteOperationAsyncTask = new AsyncTask() {
-            @Override
-            protected Object doInBackground(Object[] params) {
-                if (getContext() != null && !isCancelled()) {
-                    RemoteOperationResult remoteOperationResult = remoteOperation.execute(currentAccount, getContext());
+        getRecyclerView().setOnScrollListener(onScrollChangeListener);
+    }
 
-                    FileDataStorageManager storageManager = null;
-                    if (mContainerActivity != null && mContainerActivity.getStorageManager() != null) {
-                        storageManager = mContainerActivity.getStorageManager();
-                    }
+    // TODO refactor, can only used for photo search atm
+    private void search() {
+        if (!photoSearchQueryRunning && !photoSearchNoNew) {
+            remoteOperationAsyncTask = new AsyncTask() {
+                @Override
+                protected Object doInBackground(Object[] params) {
+                    if (getContext() != null && !isCancelled()) {
+                        Log_OC.d("SCROLL", "re-run search");
 
-                    if (remoteOperationResult.isSuccess() && remoteOperationResult.getData() != null
-                            && !isCancelled() && searchFragment) {
-                        if (remoteOperationResult.getData() == null || remoteOperationResult.getData().size() == 0) {
-                            setEmptyView(event);
-                        } else {
-                            mAdapter.setData(remoteOperationResult.getData(), currentSearchType, storageManager, mFile);
+                        final Account currentAccount = AccountUtils.getCurrentOwnCloudAccount(MainApp.getAppContext());
+
+                        int limit = -1;
+                        if (currentSearchType.equals(SearchType.PHOTO_SEARCH)) {
+                            limit = 15 * getColumnSize();
                         }
 
-                        final ToolbarActivity fileDisplayActivity = (ToolbarActivity) getActivity();
-                        if (fileDisplayActivity != null) {
-                            fileDisplayActivity.runOnUiThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (fileDisplayActivity != null) {
+                        long timestamp = -1;
+                        if (mAdapter.getLastTimestamp() > 0) {
+                            timestamp = mAdapter.getLastTimestamp();
+                        }
+
+                        if (remoteOperation instanceof SearchOperation) {
+                            SearchOperation searchOperation = (SearchOperation) remoteOperation;
+                            searchOperation.setLimit(limit);
+                            searchOperation.setTimestamp(timestamp);
+                        }
+
+                        RemoteOperationResult remoteOperationResult = remoteOperation.execute(currentAccount, getContext());
+
+                        FileDataStorageManager storageManager = null;
+                        if (mContainerActivity != null && mContainerActivity.getStorageManager() != null) {
+                            storageManager = mContainerActivity.getStorageManager();
+                        }
+
+                        if (remoteOperationResult.isSuccess() && remoteOperationResult.getData() != null
+                                && !isCancelled() && searchFragment) {
+                            if (remoteOperationResult.getData() == null || remoteOperationResult.getData().size() == 0) {
+                                photoSearchNoNew = true;
+                                // todo how distinguish to show 
+                                // setEmptyView(event);
+                            } else {
+                                mAdapter.setData(remoteOperationResult.getData(), currentSearchType, storageManager, mFile, false);
+                            }
+
+                            final ToolbarActivity fileDisplayActivity = (ToolbarActivity) getActivity();
+                            if (fileDisplayActivity != null) {
+                                fileDisplayActivity.runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
                                         fileDisplayActivity.setIndeterminate(false);
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
+
+                        return remoteOperationResult.isSuccess();
+                    } else {
+                        return false;
                     }
-
-                    return remoteOperationResult.isSuccess();
-                } else {
-                    return false;
                 }
-            }
 
-            @Override
-            protected void onPostExecute(Object o) {
-                if (!isCancelled()) {
-                    mAdapter.notifyDataSetChanged();
+                @Override
+                protected void onPostExecute(Object o) {
+                    photoSearchQueryRunning = false;
+                    if (!isCancelled()) {
+                        mAdapter.notifyDataSetChanged();
+                    }
                 }
-            }
-        };
+            };
 
-        remoteOperationAsyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, true);
+            remoteOperationAsyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, true);
+        }
     }
 
     @Subscribe(threadMode = ThreadMode.BACKGROUND)
@@ -1650,7 +1702,8 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     @Override
     public void onRefresh() {
         if (searchEvent != null && searchFragment) {
-            onMessageEvent(searchEvent);
+            mAdapter.resetLastTimestamp();
+            onMessageEvent(searchEvent, true);
 
             mRefreshListLayout.setRefreshing(false);
         } else {
